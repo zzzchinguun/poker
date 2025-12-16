@@ -1,3 +1,33 @@
+const fs = require('fs');
+const path = require('path');
+
+// Load .env values without external dependency fallback
+function loadEnvFallback() {
+  const envPath = path.join(__dirname, '.env');
+  if (!fs.existsSync(envPath)) return;
+  const envLines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/);
+  envLines.forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) return;
+    const [key, ...rest] = trimmed.split('=');
+    if (!key) return;
+    const value = rest.join('=').trim();
+    if (!Object.prototype.hasOwnProperty.call(process.env, key)) {
+      process.env[key] = value;
+    }
+  });
+}
+
+try {
+  require('dotenv').config(); // prefer real dotenv if available
+} catch (err) {
+  if (err.code === 'MODULE_NOT_FOUND') {
+    loadEnvFallback();
+  } else {
+    throw err;
+  }
+}
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
