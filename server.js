@@ -8,6 +8,26 @@ const server = http.createServer(app);
 
 const PORT = process.env.PORT || 3001;
 
+// Clean game state logging
+function stateLog(tableId) {
+  const state = tables.get(tableId);
+  if (!state) return;
+  const p = state.players;
+  console.log('─'.repeat(60));
+  console.log(`TABLE ${tableId.slice(-4)} | Phase: ${state.phase} | Pot: $${state.pot} | Bet: $${state.currentBet}`);
+  console.log(`Players:`);
+  p.forEach((player, i) => {
+    const roles = [
+      player.isDealer ? 'D' : '',
+      player.isSmallBlind ? 'SB' : '',
+      player.isBigBlind ? 'BB' : '',
+    ].filter(Boolean).join('/') || '-';
+    const status = player.folded ? 'FOLD' : player.isTurn ? '>>> TURN' : 'wait';
+    console.log(`  [${i}] ${player.name.padEnd(15)} | $${String(player.chips).padStart(4)} | bet:$${String(player.bet).padStart(3)} | ${roles.padEnd(5)} | ${status}`);
+  });
+  console.log('─'.repeat(60));
+}
+
 // Initialize Supabase with Service Role Key
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -35,46 +55,25 @@ const io = new Server(server, {
 // Middleware to authenticate socket connections
 io.use(async (socket, next) => {
   const token = socket.handshake.auth.token;
-  console.log('[Auth] Token received:', token ? `${token.slice(0, 30)}...` : 'NO TOKEN');
-
   if (!token) {
-    console.log('[Auth] No token provided');
     return next(new Error('Authentication required'));
   }
 
   if (supabase) {
-    console.log('[Auth] Validating token with Supabase...');
     try {
       const { data, error } = await supabase.auth.getUser(token);
-      console.log('[Auth] Supabase response:', {
-        hasData: !!data,
-        hasUser: !!data?.user,
-        userId: data?.user?.id,
-        error: error ? { message: error.message, status: error.status } : null
-      });
-
-      if (error) {
-        console.log('[Auth] Supabase error:', error.message);
-        return next(new Error(`Invalid token: ${error.message}`));
-      }
-      if (!data?.user) {
-        console.log('[Auth] No user in response');
-        return next(new Error('Invalid token: No user found'));
+      if (error || !data?.user) {
+        return next(new Error('Invalid token'));
       }
       socket.userId = data.user.id;
       socket.userEmail = data.user.email;
-      console.log('[Auth] User authenticated:', socket.userId);
     } catch (err) {
-      console.error('[Auth] Exception during validation:', err);
       return next(new Error(`Auth error: ${err.message}`));
     }
   } else {
-    // Dev mode without Supabase
-    console.log('[Auth] Dev mode - no Supabase');
     socket.userId = 'dev-user-' + socket.id;
     socket.userEmail = 'dev@test.com';
   }
-
   next();
 });
 
@@ -118,11 +117,8 @@ async function getUsername(userId) {
 }
 
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.userId} (${socket.id})`);
-
   // Join a table
   socket.on('join_table', async ({ tableId }) => {
-    console.log(`${socket.userId} joining table ${tableId}`);
 
     const state = getTableState(tableId);
     const existingPlayer = state.players.find((p) => p.id === socket.userId);
@@ -175,7 +171,7 @@ io.on('connection', (socket) => {
         .eq('id', tableId);
     }
 
-    console.log(`Table ${tableId} now has ${state.players.length} players`);
+    console.log(`\n👤 JOIN: ${username} joined table ${tableId.slice(-4)} (${state.players.length} players)`);
 
     // Start game if we have 2+ players and game is waiting
     if (state.players.length >= 2 && state.phase === 'waiting') {
@@ -187,7 +183,6 @@ io.on('connection', (socket) => {
 
   // Leave a table
   socket.on('leave_table', async ({ tableId }) => {
-    console.log(`${socket.userId} leaving table ${tableId}`);
     await removePlayerFromTable(socket, tableId);
   });
 
@@ -205,7 +200,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    console.log(`${player.name} action: ${action} ${amount || ''}`);
+    console.log(`\n▶ ACTION: ${player.name} → ${action.toUpperCase()}${amount ? ' $' + amount : ''}`);
 
     switch (action) {
       case 'fold':
@@ -245,10 +240,8 @@ io.on('connection', (socket) => {
 
   // Handle disconnect
   socket.on('disconnect', async () => {
-    console.log(`User disconnected: ${socket.userId}`);
     const playerData = playerSockets.get(socket.id);
     if (playerData) {
-      // Pass the userId explicitly since socket might lose context
       await removePlayerFromTable(socket, playerData.tableId, playerData.odilsId);
       playerSockets.delete(socket.id);
     }
@@ -268,8 +261,7 @@ async function removePlayerFromTable(socket, tableId, odilsId = null) {
   const player = state.players[playerIndex];
   const wasPlayersTurn = player.isTurn;
 
-  console.log(`[Leave] Removing player ${player.name} (${odils}) from table ${tableId}`);
-  console.log(`[Leave] Player had ${player.chips} chips, was their turn: ${wasPlayersTurn}`);
+  console.log(`\n👋 LEAVE: ${player.name} left table ${tableId.slice(-4)} (chips: $${player.chips})`);
 
   // Save player's chips to database before removing
   if (supabase && player.chips !== 1000) {
@@ -289,10 +281,8 @@ async function removePlayerFromTable(socket, tableId, odilsId = null) {
         .from('profiles')
         .update({ balance: newBalance })
         .eq('id', odils);
-
-      console.log(`[Leave] Updated ${player.name}'s balance: ${currentBalance} + ${chipsChange} = ${newBalance}`);
     } catch (err) {
-      console.error(`[Leave] Failed to update balance:`, err);
+      console.error(`   └─ Failed to save balance:`, err.message);
     }
   }
 
@@ -369,7 +359,7 @@ function startNewHand(tableId) {
   const state = tables.get(tableId);
   if (!state || state.players.length < 2) return;
 
-  console.log(`Starting new hand at table ${tableId} with ${state.players.length} players`);
+  console.log('\n🃏 NEW HAND STARTING');
 
   // Ensure dealerIndex is valid
   state.dealerIndex = state.dealerIndex % state.players.length;
@@ -432,9 +422,7 @@ function startNewHand(tableId) {
   state.players[firstToAct].isTurn = true;
   state.currentPlayerIndex = firstToAct;
 
-  console.log(`[Hand] Dealer: ${state.players[state.dealerIndex].name}, SB: ${state.players[sbIndex].name}, BB: ${state.players[bbIndex].name}`);
-  console.log(`[Hand] First to act: ${state.players[firstToAct].name}`);
-
+  stateLog(tableId);
   broadcastGameState(tableId);
 }
 
@@ -466,28 +454,21 @@ function moveToNextPlayer(tableId) {
   }
 
   // Check if betting round is complete
-  // Everyone who hasn't folded has either:
-  // 1. Matched the current bet, OR
-  // 2. Is all-in (chips === 0)
-  // AND we've gone around at least once (tracked by checking if we're back to/past the last raiser)
   const bettingComplete = activePlayers.every(
     (p) => p.bet === state.currentBet || p.chips === 0
   );
-
-  // We need to check if everyone has had a chance to act
-  // In heads-up preflop: SB acts first, BB can raise, then SB again, etc.
-  // The round is complete when both have matched and it's cycled back
   const everyoneActed = bettingComplete && nextIndex <= state.currentPlayerIndex;
 
-  console.log(`[Turn] Current: ${state.currentPlayerIndex}, Next: ${nextIndex}, BettingComplete: ${bettingComplete}, EveryoneActed: ${everyoneActed}`);
+  console.log(`   ├─ Betting complete: ${bettingComplete} | Everyone acted: ${everyoneActed}`);
+  console.log(`   └─ Current idx: ${state.currentPlayerIndex} → Next idx: ${nextIndex}`);
 
   if (everyoneActed) {
-    // Move to next phase
     advancePhase(tableId);
   } else {
     state.players[nextIndex].isTurn = true;
     state.currentPlayerIndex = nextIndex;
-    console.log(`[Turn] Now ${state.players[nextIndex].name}'s turn`);
+    console.log(`\n⏳ TURN: ${state.players[nextIndex].name}`);
+    stateLog(tableId);
     broadcastGameState(tableId);
   }
 }
@@ -541,8 +522,8 @@ function advancePhase(tableId) {
   state.players[firstToAct].isTurn = true;
   state.currentPlayerIndex = firstToAct;
 
-  console.log(`[Phase] Advanced to ${state.phase}, first to act: ${state.players[firstToAct].name}`);
-
+  console.log(`\n📍 PHASE: ${state.phase.toUpperCase()} | Cards: [${state.communityCards.join(' ')}]`);
+  stateLog(tableId);
   broadcastGameState(tableId);
 }
 
@@ -551,7 +532,7 @@ function endHand(tableId, winner) {
   const state = tables.get(tableId);
   if (!state) return;
 
-  console.log(`${winner.name} wins ${state.pot}`);
+  console.log(`\n🏆 WINNER: ${winner.name} wins $${state.pot}`);
 
   winner.chips += state.pot;
 
