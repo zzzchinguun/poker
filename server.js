@@ -428,7 +428,13 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', tables: tables.size });
+  res.json({
+    status: 'ok',
+    tables: tables.size,
+    supabaseConfigured: !!supabase,
+    hasUrl: !!process.env.SUPABASE_URL,
+    hasKey: !!process.env.SUPABASE_SERVICE_ROLE_KEY
+  });
 });
 
 server.listen(PORT, () => {
