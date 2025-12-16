@@ -248,22 +248,92 @@ io.on('connection', (socket) => {
     console.log(`User disconnected: ${socket.userId}`);
     const playerData = playerSockets.get(socket.id);
     if (playerData) {
-      await removePlayerFromTable(socket, playerData.tableId);
+      // Pass the userId explicitly since socket might lose context
+      await removePlayerFromTable(socket, playerData.tableId, playerData.odilsId);
       playerSockets.delete(socket.id);
     }
   });
 });
 
 // Remove player from table
-async function removePlayerFromTable(socket, tableId) {
+async function removePlayerFromTable(socket, tableId, odilsId = null) {
   const state = tables.get(tableId);
   if (!state) return;
 
-  const playerIndex = state.players.findIndex((p) => p.id === socket.userId);
+  // Use odilsId if provided (from disconnect handler), otherwise use socket.userId
+  const odils = odilsId || socket.userId;
+  const playerIndex = state.players.findIndex((p) => p.id === odils);
   if (playerIndex === -1) return;
 
-  state.players.splice(playerIndex, 1);
+  const player = state.players[playerIndex];
+  const wasPlayersTurn = player.isTurn;
+
+  console.log(`[Leave] Removing player ${player.name} (${odils}) from table ${tableId}`);
+  console.log(`[Leave] Player had ${player.chips} chips, was their turn: ${wasPlayersTurn}`);
+
+  // Save player's chips to database before removing
+  if (supabase && player.chips !== 1000) {
+    // Update the user's balance in profiles table
+    try {
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('balance')
+        .eq('id', odils)
+        .single();
+
+      const currentBalance = profile?.balance || 0;
+      const chipsChange = player.chips - 1000; // Difference from starting chips
+      const newBalance = currentBalance + chipsChange;
+
+      await supabase
+        .from('profiles')
+        .update({ balance: newBalance })
+        .eq('id', odils);
+
+      console.log(`[Leave] Updated ${player.name}'s balance: ${currentBalance} + ${chipsChange} = ${newBalance}`);
+    } catch (err) {
+      console.error(`[Leave] Failed to update balance:`, err);
+    }
+  }
+
+  // If it was this player's turn, move to next player before removing
+  if (wasPlayersTurn && state.players.length > 1) {
+    player.isTurn = false;
+    player.folded = true; // Mark as folded so they're skipped
+
+    // Check if only one active player remains
+    const activePlayers = state.players.filter((p) => !p.folded && p.id !== odils);
+    if (activePlayers.length === 1) {
+      // Award pot to remaining player
+      state.players.splice(playerIndex, 1);
+      endHand(tableId, activePlayers[0]);
+
+      // Update DB
+      if (supabase) {
+        await supabase
+          .from('poker_tables')
+          .update({ current_players: state.players.length })
+          .eq('id', tableId);
+      }
+      socket.leave(tableId);
+      return;
+    }
+
+    // Move to next player
+    moveToNextPlayer(tableId);
+  }
+
+  // Now remove the player
+  const newPlayerIndex = state.players.findIndex((p) => p.id === odils);
+  if (newPlayerIndex !== -1) {
+    state.players.splice(newPlayerIndex, 1);
+  }
   socket.leave(tableId);
+
+  // Adjust currentPlayerIndex if needed
+  if (state.currentPlayerIndex >= state.players.length) {
+    state.currentPlayerIndex = 0;
+  }
 
   // Update DB
   if (supabase) {
@@ -279,6 +349,16 @@ async function removePlayerFromTable(socket, tableId) {
     state.communityCards = [];
     state.pot = 0;
     state.currentBet = 0;
+    // Reset remaining player's state
+    state.players.forEach((p) => {
+      p.isTurn = false;
+      p.folded = false;
+      p.bet = 0;
+      p.cards = null;
+      p.isDealer = false;
+      p.isSmallBlind = false;
+      p.isBigBlind = false;
+    });
   }
 
   broadcastGameState(tableId);
@@ -289,7 +369,33 @@ function startNewHand(tableId) {
   const state = tables.get(tableId);
   if (!state || state.players.length < 2) return;
 
-  console.log(`Starting new hand at table ${tableId}`);
+  console.log(`Starting new hand at table ${tableId} with ${state.players.length} players`);
+
+  // Ensure dealerIndex is valid
+  state.dealerIndex = state.dealerIndex % state.players.length;
+
+  const numPlayers = state.players.length;
+  const isHeadsUp = numPlayers === 2;
+
+  // In heads-up (2 players):
+  // - Dealer is Small Blind and acts FIRST preflop, LAST post-flop
+  // - Other player is Big Blind
+  // In 3+ players:
+  // - Dealer is just dealer
+  // - Next player is Small Blind
+  // - Next is Big Blind
+  // - First to act preflop is after Big Blind
+
+  let sbIndex, bbIndex;
+  if (isHeadsUp) {
+    // Heads-up: dealer is small blind
+    sbIndex = state.dealerIndex;
+    bbIndex = (state.dealerIndex + 1) % numPlayers;
+  } else {
+    // 3+ players: standard positions
+    sbIndex = (state.dealerIndex + 1) % numPlayers;
+    bbIndex = (state.dealerIndex + 2) % numPlayers;
+  }
 
   // Reset players
   state.players.forEach((p, i) => {
@@ -297,15 +403,12 @@ function startNewHand(tableId) {
     p.bet = 0;
     p.folded = false;
     p.isDealer = i === state.dealerIndex;
-    p.isSmallBlind = i === (state.dealerIndex + 1) % state.players.length;
-    p.isBigBlind = i === (state.dealerIndex + 2) % state.players.length;
+    p.isSmallBlind = i === sbIndex;
+    p.isBigBlind = i === bbIndex;
     p.isTurn = false;
   });
 
   // Post blinds
-  const sbIndex = (state.dealerIndex + 1) % state.players.length;
-  const bbIndex = (state.dealerIndex + 2) % state.players.length;
-
   state.players[sbIndex].chips -= 5;
   state.players[sbIndex].bet = 5;
   state.players[bbIndex].chips -= 10;
@@ -316,10 +419,21 @@ function startNewHand(tableId) {
   state.communityCards = [];
   state.phase = 'preflop';
 
-  // First to act is after big blind
-  const firstToAct = (bbIndex + 1) % state.players.length;
+  // First to act preflop:
+  // - Heads-up: dealer/small blind acts first
+  // - 3+ players: player after big blind acts first
+  let firstToAct;
+  if (isHeadsUp) {
+    firstToAct = sbIndex; // Dealer/SB acts first in heads-up preflop
+  } else {
+    firstToAct = (bbIndex + 1) % numPlayers;
+  }
+
   state.players[firstToAct].isTurn = true;
   state.currentPlayerIndex = firstToAct;
+
+  console.log(`[Hand] Dealer: ${state.players[state.dealerIndex].name}, SB: ${state.players[sbIndex].name}, BB: ${state.players[bbIndex].name}`);
+  console.log(`[Hand] First to act: ${state.players[firstToAct].name}`);
 
   broadcastGameState(tableId);
 }
@@ -337,6 +451,11 @@ function moveToNextPlayer(tableId) {
     return;
   }
 
+  if (activePlayers.length === 0) {
+    console.log(`[Turn] No active players, ending hand`);
+    return;
+  }
+
   // Find next active player
   let nextIndex = (state.currentPlayerIndex + 1) % state.players.length;
   let attempts = 0;
@@ -346,17 +465,29 @@ function moveToNextPlayer(tableId) {
     attempts++;
   }
 
-  // Check if betting round is complete (everyone has matched the bet)
+  // Check if betting round is complete
+  // Everyone who hasn't folded has either:
+  // 1. Matched the current bet, OR
+  // 2. Is all-in (chips === 0)
+  // AND we've gone around at least once (tracked by checking if we're back to/past the last raiser)
   const bettingComplete = activePlayers.every(
     (p) => p.bet === state.currentBet || p.chips === 0
   );
 
-  if (bettingComplete && nextIndex <= state.currentPlayerIndex) {
+  // We need to check if everyone has had a chance to act
+  // In heads-up preflop: SB acts first, BB can raise, then SB again, etc.
+  // The round is complete when both have matched and it's cycled back
+  const everyoneActed = bettingComplete && nextIndex <= state.currentPlayerIndex;
+
+  console.log(`[Turn] Current: ${state.currentPlayerIndex}, Next: ${nextIndex}, BettingComplete: ${bettingComplete}, EveryoneActed: ${everyoneActed}`);
+
+  if (everyoneActed) {
     // Move to next phase
     advancePhase(tableId);
   } else {
     state.players[nextIndex].isTurn = true;
     state.currentPlayerIndex = nextIndex;
+    console.log(`[Turn] Now ${state.players[nextIndex].name}'s turn`);
     broadcastGameState(tableId);
   }
 }
@@ -386,20 +517,31 @@ function advancePhase(tableId) {
     case 'river':
       state.phase = 'showdown';
       // Determine winner (simplified - random for now)
-      const activePlayers = state.players.filter((p) => !p.folded);
-      const winner = activePlayers[Math.floor(Math.random() * activePlayers.length)];
+      const activePlayersForWinner = state.players.filter((p) => !p.folded);
+      const winner = activePlayersForWinner[Math.floor(Math.random() * activePlayersForWinner.length)];
       endHand(tableId, winner);
       return;
   }
 
-  // First active player after dealer starts
+  // Post-flop: first active player after dealer starts
+  // In heads-up: this will be the big blind (non-dealer)
+  const activePlayers = state.players.filter((p) => !p.folded);
+  if (activePlayers.length === 0) return;
+
   const dealerIndex = state.players.findIndex((p) => p.isDealer);
   let firstToAct = (dealerIndex + 1) % state.players.length;
-  while (state.players[firstToAct].folded) {
+  let attempts = 0;
+
+  // Find first non-folded player after dealer
+  while (state.players[firstToAct].folded && attempts < state.players.length) {
     firstToAct = (firstToAct + 1) % state.players.length;
+    attempts++;
   }
+
   state.players[firstToAct].isTurn = true;
   state.currentPlayerIndex = firstToAct;
+
+  console.log(`[Phase] Advanced to ${state.phase}, first to act: ${state.players[firstToAct].name}`);
 
   broadcastGameState(tableId);
 }
