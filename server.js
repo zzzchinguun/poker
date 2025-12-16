@@ -89,6 +89,8 @@ function getTableState(tableId) {
       phase: 'waiting', // waiting, preflop, flop, turn, river, showdown
       dealerIndex: 0,
       currentPlayerIndex: 0,
+      roundStartIndex: 0, // Track where betting round started
+      actedThisRound: new Set(), // Track who has acted in current betting round
       turnTimer: 30,
     });
   }
@@ -230,7 +232,15 @@ io.on('connection', (socket) => {
         player.bet = totalBet;
         state.currentBet = totalBet;
         state.pot += toAdd;
+        // When someone raises, reset who needs to act (everyone except raiser)
+        state.actedThisRound.clear();
+        state.actedThisRound.add(player.id);
         break;
+    }
+
+    // Mark this player as having acted (for non-raise actions)
+    if (action !== 'bet' && action !== 'raise') {
+      state.actedThisRound.add(player.id);
     }
 
     // Move to next player
@@ -408,6 +418,7 @@ function startNewHand(tableId) {
   state.currentBet = 10;
   state.communityCards = [];
   state.phase = 'preflop';
+  state.actedThisRound = new Set(); // Reset for new hand - blinds don't count as actions
 
   // First to act preflop:
   // - Heads-up: dealer/small blind acts first
@@ -453,16 +464,20 @@ function moveToNextPlayer(tableId) {
     attempts++;
   }
 
-  // Check if betting round is complete
+  // Check if betting round is complete:
+  // 1. All active players have matching bets (or are all-in)
+  // 2. All active players have had a chance to act this round
   const bettingComplete = activePlayers.every(
     (p) => p.bet === state.currentBet || p.chips === 0
   );
-  const everyoneActed = bettingComplete && nextIndex <= state.currentPlayerIndex;
+  const everyoneActed = activePlayers.every(
+    (p) => state.actedThisRound.has(p.id) || p.chips === 0
+  );
 
   console.log(`   ├─ Betting complete: ${bettingComplete} | Everyone acted: ${everyoneActed}`);
-  console.log(`   └─ Current idx: ${state.currentPlayerIndex} → Next idx: ${nextIndex}`);
+  console.log(`   └─ Acted this round: [${Array.from(state.actedThisRound).map(id => state.players.find(p => p.id === id)?.name || id.slice(-4)).join(', ')}]`);
 
-  if (everyoneActed) {
+  if (bettingComplete && everyoneActed) {
     advancePhase(tableId);
   } else {
     state.players[nextIndex].isTurn = true;
@@ -478,9 +493,10 @@ function advancePhase(tableId) {
   const state = tables.get(tableId);
   if (!state) return;
 
-  // Reset bets for new round
+  // Reset bets and action tracking for new round
   state.players.forEach((p) => (p.bet = 0));
   state.currentBet = 0;
+  state.actedThisRound.clear();
 
   switch (state.phase) {
     case 'preflop':
