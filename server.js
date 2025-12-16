@@ -35,19 +35,42 @@ const io = new Server(server, {
 // Middleware to authenticate socket connections
 io.use(async (socket, next) => {
   const token = socket.handshake.auth.token;
+  console.log('[Auth] Token received:', token ? `${token.slice(0, 30)}...` : 'NO TOKEN');
+
   if (!token) {
+    console.log('[Auth] No token provided');
     return next(new Error('Authentication required'));
   }
 
   if (supabase) {
-    const { data: { user }, error } = await supabase.auth.getUser(token);
-    if (error || !user) {
-      return next(new Error('Invalid token'));
+    console.log('[Auth] Validating token with Supabase...');
+    try {
+      const { data, error } = await supabase.auth.getUser(token);
+      console.log('[Auth] Supabase response:', {
+        hasData: !!data,
+        hasUser: !!data?.user,
+        userId: data?.user?.id,
+        error: error ? { message: error.message, status: error.status } : null
+      });
+
+      if (error) {
+        console.log('[Auth] Supabase error:', error.message);
+        return next(new Error(`Invalid token: ${error.message}`));
+      }
+      if (!data?.user) {
+        console.log('[Auth] No user in response');
+        return next(new Error('Invalid token: No user found'));
+      }
+      socket.userId = data.user.id;
+      socket.userEmail = data.user.email;
+      console.log('[Auth] User authenticated:', socket.userId);
+    } catch (err) {
+      console.error('[Auth] Exception during validation:', err);
+      return next(new Error(`Auth error: ${err.message}`));
     }
-    socket.userId = user.id;
-    socket.userEmail = user.email;
   } else {
     // Dev mode without Supabase
+    console.log('[Auth] Dev mode - no Supabase');
     socket.userId = 'dev-user-' + socket.id;
     socket.userEmail = 'dev@test.com';
   }
@@ -433,8 +456,31 @@ app.get('/health', (req, res) => {
     tables: tables.size,
     supabaseConfigured: !!supabase,
     hasUrl: !!process.env.SUPABASE_URL,
-    hasKey: !!process.env.SUPABASE_SERVICE_ROLE_KEY
+    hasKey: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+    supabaseUrl: process.env.SUPABASE_URL ? process.env.SUPABASE_URL.slice(0, 30) + '...' : null
   });
+});
+
+// Debug endpoint to test token validation
+app.post('/debug/validate-token', express.json(), async (req, res) => {
+  const { token } = req.body;
+  if (!token) {
+    return res.status(400).json({ error: 'No token provided' });
+  }
+  if (!supabase) {
+    return res.status(500).json({ error: 'Supabase not configured' });
+  }
+  try {
+    const { data, error } = await supabase.auth.getUser(token);
+    res.json({
+      success: !error && !!data?.user,
+      userId: data?.user?.id,
+      email: data?.user?.email,
+      error: error ? { message: error.message, status: error.status } : null
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 server.listen(PORT, () => {
